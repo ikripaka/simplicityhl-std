@@ -2,7 +2,8 @@
 // part of it, so per-crate dead-code analysis would warn about the rest.
 #![allow(dead_code)]
 
-use simplex::program::{Program, WitnessTrait};
+use simplex::program::Program;
+use simplex::simplicityhl::WitnessValues;
 use simplex::simplicityhl::elements::Script;
 use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
@@ -52,7 +53,7 @@ pub fn construct_final_tx<W>(
     data: Option<&[u8]>,
 ) -> anyhow::Result<FinalTransaction>
 where
-    W: WitnessTrait + 'static,
+    W: Into<WitnessValues> + 'static,
 {
     let utxos = context
         .get_default_provider()
@@ -61,7 +62,7 @@ where
     let mut ft = FinalTransaction::new();
     ft.add_program_input(
         PartialInput::new(utxos[0].clone()),
-        ProgramInput::new(Box::new(program.as_ref().clone()), Box::new(witness)),
+        ProgramInput::new(Box::new(program.as_ref().clone()), witness),
         RequiredSignature::None,
     );
 
@@ -81,7 +82,7 @@ pub fn spend<W>(
     data: Option<&[u8]>,
 ) -> anyhow::Result<String>
 where
-    W: WitnessTrait + 'static,
+    W: Into<WitnessValues> + 'static,
 {
     let ft = construct_final_tx(context, program, script, witness, data)?;
 
@@ -116,7 +117,7 @@ pub fn run<W>(
     expect: Expect,
 ) -> anyhow::Result<()>
 where
-    W: WitnessTrait + 'static,
+    W: Into<WitnessValues> + 'static,
 {
     let script = fund(context, &program)?;
     let result = spend(context, &program, &script, witness, None);
@@ -134,7 +135,7 @@ pub fn run_with_op_return<W>(
     data: &[u8],
 ) -> anyhow::Result<()>
 where
-    W: WitnessTrait + 'static,
+    W: Into<WitnessValues> + 'static,
 {
     let script = fund(context, &program)?;
     let result = spend(context, &program, &script, witness, Some(data));
