@@ -38,3 +38,39 @@ mod u128_math_tests {
     // Stamps the 22 `#[simplex::test]` entry points for u128. Logic lives in common::uint.
     uint_tests!(u128);
 }
+
+mod u128_math_tests_fuzz {
+    use super::*;
+
+    use common::uint_fuzz::TestUintFuzz;
+    use simplex::fuzz::FuzzEngineBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+
+    type U128MathFuzzEngineBuilder =
+        FuzzEngineBuilder<U128MathTestProgram, U128MathTestArguments, U128MathTestWitness>;
+
+    impl TestUintFuzz for u128 {
+        type Arguments = U128MathTestArguments;
+
+        fn arguments() -> Self::Arguments {
+            U128MathTestArguments {}
+        }
+
+        fn arb_any() -> BoxedStrategy<Self> {
+            any::<u128>().boxed()
+        }
+
+        fn arb_non_zero() -> BoxedStrategy<Self> {
+            any::<u128>()
+                .prop_filter("u128 should not be zero", |value| *value != 0)
+                .boxed()
+        }
+
+        fn arb_fitting(low: Self, high: Self) -> BoxedStrategy<Self> {
+            (low..=high).boxed()
+        }
+    }
+
+    uint_fuzz_tests!(u128, U128MathFuzzEngineBuilder);
+}

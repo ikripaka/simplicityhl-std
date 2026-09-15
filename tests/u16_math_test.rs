@@ -38,3 +38,39 @@ mod u16_math_tests {
     // Stamps the 22 `#[simplex::test]` entry points for u16. Logic lives in common::uint.
     uint_tests!(u16);
 }
+
+mod u16_math_tests_fuzz {
+    use super::*;
+
+    use common::uint_fuzz::TestUintFuzz;
+    use simplex::fuzz::FuzzEngineBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+
+    type U16MathFuzzEngineBuilder =
+        FuzzEngineBuilder<U16MathTestProgram, U16MathTestArguments, U16MathTestWitness>;
+
+    impl TestUintFuzz for u16 {
+        type Arguments = U16MathTestArguments;
+
+        fn arguments() -> Self::Arguments {
+            U16MathTestArguments {}
+        }
+
+        fn arb_any() -> BoxedStrategy<Self> {
+            any::<u16>().boxed()
+        }
+
+        fn arb_non_zero() -> BoxedStrategy<Self> {
+            any::<u16>()
+                .prop_filter("u16 should not be zero", |value| *value != 0)
+                .boxed()
+        }
+
+        fn arb_fitting(low: Self, high: Self) -> BoxedStrategy<Self> {
+            (low..=high).boxed()
+        }
+    }
+
+    uint_fuzz_tests!(u16, U16MathFuzzEngineBuilder);
+}

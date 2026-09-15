@@ -567,3 +567,520 @@ mod secp256k1_operations_tests {
         )
     }
 }
+
+mod secp256k1_operations_tests_fuzz {
+    use super::*;
+
+    use common::core::FuzzExecutionCheck;
+    use simplex::fuzz;
+    use simplex::fuzz::builders::{FinalTransactionBuilder, ProgramTarget};
+    use simplex::fuzz::engine::FuzzStrategyBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+    use simplex::fuzz::{FuzzEngineBuilder, FuzzError};
+    use simplex::simplicityhl::{Arguments, WitnessValues};
+    use simplex::transaction::{FinalTransaction, PartialInput, RequiredSignature, UTXO};
+
+    const PROGRAM_TARGET: ProgramTarget = ProgramTarget::Input(0);
+
+    type Ge = ([u8; 32], [u8; 32]);
+    type Gej = (Ge, [u8; 32]);
+    type Point = (u8, [u8; 32]);
+    type Secp256k1FuzzEngineBuilder = FuzzEngineBuilder<
+        Secp256k1OperationsTestProgram,
+        Secp256k1OperationsTestArguments,
+        Secp256k1OperationsTestWitness,
+    >;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Secp256k1FuzzCase {
+        function: u8,
+        first_uint: [u8; 32],
+        second_uint: [u8; 32],
+        first_ge: Ge,
+        second_ge: Ge,
+        first_gej: Gej,
+        second_gej: Gej,
+        first_point: Point,
+        expected_uint: [u8; 32],
+        expected_ge: Ge,
+        expected_gej: Gej,
+        expected_point: Point,
+    }
+
+    fn initial_transaction() -> FinalTransaction {
+        let mut tx = FinalTransaction::new();
+        tx.add_input(PartialInput::new(UTXO::default()), RequiredSignature::None);
+        tx
+    }
+
+    fn transaction_builder() -> Result<FinalTransactionBuilder, FuzzError> {
+        FinalTransactionBuilder::new(initial_transaction(), [PROGRAM_TARGET])
+    }
+
+    fn arb_fe() -> impl Strategy<Value = [u8; 32]> {
+        any::<[u8; 32]>().prop_filter("valid secp256k1 field element", |value| *value < SECP_P)
+    }
+
+    fn arb_non_zero_fe() -> impl Strategy<Value = [u8; 32]> {
+        arb_fe().prop_filter("non-zero secp256k1 field element", |value| {
+            *value != [0; 32]
+        })
+    }
+
+    fn arb_scalar() -> impl Strategy<Value = [u8; 32]> {
+        any::<[u8; 32]>().prop_filter("valid secp256k1 scalar", |value| *value < SECP_N)
+    }
+
+    fn arb_secret_key() -> impl Strategy<Value = SecretKey> {
+        any::<[u8; 32]>().prop_filter_map("valid secp256k1 secret key", |bytes| {
+            SecretKey::from_slice(&bytes).ok()
+        })
+    }
+
+    fn ge_from_secret_key(secret_key: SecretKey) -> Ge {
+        let secp = Secp256k1::new();
+        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+        let serialized = public_key.serialize_uncompressed();
+
+        let mut x = [0; 32];
+        x.copy_from_slice(&serialized[1..33]);
+
+        let mut y = [0; 32];
+        y.copy_from_slice(&serialized[33..65]);
+
+        (x, y)
+    }
+
+    fn arb_ge() -> impl Strategy<Value = Ge> {
+        arb_secret_key().prop_map(ge_from_secret_key)
+    }
+
+    fn fuzz_strategy(
+        cases: BoxedStrategy<Secp256k1FuzzCase>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<
+            Secp256k1OperationsTestArguments,
+            Secp256k1OperationsTestWitness,
+            _,
+        >::new()
+        .with_custom_strategy(cases.prop_map(|case| {
+            let arguments: Arguments = Secp256k1OperationsTestArguments {}.into();
+            let witness: WitnessValues = build_witness(
+                case.function,
+                case.first_uint,
+                case.second_uint,
+                case.first_ge,
+                case.second_ge,
+                case.first_gej,
+                case.second_gej,
+                case.first_point,
+                case.expected_uint,
+                case.expected_ge,
+                case.expected_gej,
+                case.expected_point,
+            )
+            .into();
+
+            (arguments, witness)
+        }))
+        .build()
+    }
+
+    fn run_secp256k1_fuzz(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+        strategy: BoxedStrategy<(Arguments, WitnessValues)>,
+        test_name: &'static str,
+        expect: Expect,
+    ) -> anyhow::Result<()> {
+        let transaction_builder = transaction_builder()?;
+
+        fuzz_engine_builder
+            .build(strategy, transaction_builder)
+            .run_with_check(FuzzExecutionCheck::new(test_name, expect));
+
+        Ok(())
+    }
+
+    #[simplex::fuzz]
+    fn ge_to_point_matches_parity(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_ge()
+                    .prop_map(|ge| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::GeToPoint),
+                        first_uint: DEFAULT_UINT,
+                        second_uint: DEFAULT_UINT,
+                        first_ge: ge,
+                        second_ge: DEFAULT_GE,
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: DEFAULT_UINT,
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: compress(ge),
+                    })
+                    .boxed(),
+            ),
+            "ge_to_point",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn point_to_gej_roundtrip(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_ge()
+                    .prop_map(|ge| {
+                        let point = compress(ge);
+                        Secp256k1FuzzCase {
+                            function: op(FunctionToTest::PointToGej),
+                            first_uint: DEFAULT_UINT,
+                            second_uint: DEFAULT_UINT,
+                            first_ge: DEFAULT_GE,
+                            second_ge: DEFAULT_GE,
+                            first_gej: DEFAULT_GEJ,
+                            second_gej: DEFAULT_GEJ,
+                            first_point: point,
+                            expected_uint: DEFAULT_UINT,
+                            expected_ge: DEFAULT_GE,
+                            expected_gej: DEFAULT_GEJ,
+                            expected_point: point,
+                        }
+                    })
+                    .boxed(),
+            ),
+            "point_to_gej",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn fe_sub_matches_reference(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_fe(), arb_fe())
+                    .prop_map(|(a, b)| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::FeSub),
+                        first_uint: a,
+                        second_uint: b,
+                        first_ge: DEFAULT_GE,
+                        second_ge: DEFAULT_GE,
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: fe_sub_ref(a, b),
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: DEFAULT_POINT,
+                    })
+                    .boxed(),
+            ),
+            "fe_sub",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn scalar_sub_matches_reference(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_scalar(), arb_scalar())
+                    .prop_map(|(a, b)| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::ScalarSub),
+                        first_uint: a,
+                        second_uint: b,
+                        first_ge: DEFAULT_GE,
+                        second_ge: DEFAULT_GE,
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: scalar_sub_ref(a, b),
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: DEFAULT_POINT,
+                    })
+                    .boxed(),
+            ),
+            "scalar_sub",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn gej_sub_matches_reference(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_secret_key(), arb_secret_key())
+                    .prop_filter("distinct secp256k1 points", |(p, q)| p != q)
+                    .prop_map(|(p_secret, q_secret)| {
+                        let secp = Secp256k1::new();
+                        let p = PublicKey::from_secret_key(&secp, &p_secret);
+                        let q = PublicKey::from_secret_key(&secp, &q_secret);
+                        let difference = p
+                            .combine(&q.negate(&secp))
+                            .expect("distinct secp256k1 points have a non-infinite difference");
+
+                        Secp256k1FuzzCase {
+                            function: op(FunctionToTest::GejSub),
+                            first_uint: DEFAULT_UINT,
+                            second_uint: DEFAULT_UINT,
+                            first_ge: DEFAULT_GE,
+                            second_ge: DEFAULT_GE,
+                            first_gej: pk_to_gej(&p),
+                            second_gej: pk_to_gej(&q),
+                            first_point: DEFAULT_POINT,
+                            expected_uint: DEFAULT_UINT,
+                            expected_ge: DEFAULT_GE,
+                            expected_gej: pk_to_gej(&difference),
+                            expected_point: DEFAULT_POINT,
+                        }
+                    })
+                    .boxed(),
+            ),
+            "gej_sub",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn fe_eq_is_reflexive(fuzz_engine_builder: Secp256k1FuzzEngineBuilder) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_fe()
+                    .prop_map(|value| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::FeEq),
+                        first_uint: value,
+                        second_uint: value,
+                        first_ge: DEFAULT_GE,
+                        second_ge: DEFAULT_GE,
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: DEFAULT_UINT,
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: DEFAULT_POINT,
+                    })
+                    .boxed(),
+            ),
+            "fe_eq",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn scalar_eq_is_reflexive(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_scalar()
+                    .prop_map(|value| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::ScalarEq),
+                        first_uint: value,
+                        second_uint: value,
+                        first_ge: DEFAULT_GE,
+                        second_ge: DEFAULT_GE,
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: DEFAULT_UINT,
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: DEFAULT_POINT,
+                    })
+                    .boxed(),
+            ),
+            "scalar_eq",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn ge_eq_is_reflexive(fuzz_engine_builder: Secp256k1FuzzEngineBuilder) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_ge()
+                    .prop_map(|ge| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::GeEq),
+                        first_uint: DEFAULT_UINT,
+                        second_uint: DEFAULT_UINT,
+                        first_ge: ge,
+                        second_ge: ge,
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: DEFAULT_UINT,
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: DEFAULT_POINT,
+                    })
+                    .boxed(),
+            ),
+            "ge_eq",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn ge_eq_rejects_negation(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_ge()
+                    .prop_map(|ge| Secp256k1FuzzCase {
+                        function: op(FunctionToTest::GeEq),
+                        first_uint: DEFAULT_UINT,
+                        second_uint: DEFAULT_UINT,
+                        first_ge: ge,
+                        second_ge: (ge.0, fe_negate_ref(ge.1)),
+                        first_gej: DEFAULT_GEJ,
+                        second_gej: DEFAULT_GEJ,
+                        first_point: DEFAULT_POINT,
+                        expected_uint: DEFAULT_UINT,
+                        expected_ge: DEFAULT_GE,
+                        expected_gej: DEFAULT_GEJ,
+                        expected_point: DEFAULT_POINT,
+                    })
+                    .boxed(),
+            ),
+            "ge_eq negation",
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn gej_point_eq_matches_scaled_point(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_ge(), arb_non_zero_fe())
+                    .prop_map(|(ge, lambda)| {
+                        let lambda_squared = fe_mul_ref(lambda, lambda);
+                        let lambda_cubed = fe_mul_ref(lambda_squared, lambda);
+
+                        Secp256k1FuzzCase {
+                            function: op(FunctionToTest::GejPointEq),
+                            first_uint: DEFAULT_UINT,
+                            second_uint: DEFAULT_UINT,
+                            first_ge: DEFAULT_GE,
+                            second_ge: DEFAULT_GE,
+                            first_gej: (
+                                (
+                                    fe_mul_ref(ge.0, lambda_squared),
+                                    fe_mul_ref(ge.1, lambda_cubed),
+                                ),
+                                lambda,
+                            ),
+                            second_gej: DEFAULT_GEJ,
+                            first_point: compress(ge),
+                            expected_uint: DEFAULT_UINT,
+                            expected_ge: DEFAULT_GE,
+                            expected_gej: DEFAULT_GEJ,
+                            expected_point: DEFAULT_POINT,
+                        }
+                    })
+                    .boxed(),
+            ),
+            "gej_point_eq",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn gej_point_eq_rejects_negation(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_ge()
+                    .prop_map(|ge| {
+                        let (parity, x) = compress(ge);
+                        Secp256k1FuzzCase {
+                            function: op(FunctionToTest::GejPointEq),
+                            first_uint: DEFAULT_UINT,
+                            second_uint: DEFAULT_UINT,
+                            first_ge: DEFAULT_GE,
+                            second_ge: DEFAULT_GE,
+                            first_gej: ge_to_gej(ge),
+                            second_gej: DEFAULT_GEJ,
+                            first_point: (parity ^ 1, x),
+                            expected_uint: DEFAULT_UINT,
+                            expected_ge: DEFAULT_GE,
+                            expected_gej: DEFAULT_GEJ,
+                            expected_point: DEFAULT_POINT,
+                        }
+                    })
+                    .boxed(),
+            ),
+            "gej_point_eq negation",
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn safe_gej_normalize_matches_scaled_point(
+        fuzz_engine_builder: Secp256k1FuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_secp256k1_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_ge(), arb_non_zero_fe())
+                    .prop_map(|(ge, lambda)| {
+                        let lambda_squared = fe_mul_ref(lambda, lambda);
+                        let lambda_cubed = fe_mul_ref(lambda_squared, lambda);
+
+                        Secp256k1FuzzCase {
+                            function: op(FunctionToTest::SafeGejNormalize),
+                            first_uint: DEFAULT_UINT,
+                            second_uint: DEFAULT_UINT,
+                            first_ge: DEFAULT_GE,
+                            second_ge: DEFAULT_GE,
+                            first_gej: (
+                                (
+                                    fe_mul_ref(ge.0, lambda_squared),
+                                    fe_mul_ref(ge.1, lambda_cubed),
+                                ),
+                                lambda,
+                            ),
+                            second_gej: DEFAULT_GEJ,
+                            first_point: DEFAULT_POINT,
+                            expected_uint: DEFAULT_UINT,
+                            expected_ge: ge,
+                            expected_gej: DEFAULT_GEJ,
+                            expected_point: DEFAULT_POINT,
+                        }
+                    })
+                    .boxed(),
+            ),
+            "safe_gej_normalize",
+            Expect::Ok,
+        )
+    }
+}

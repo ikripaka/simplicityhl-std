@@ -38,3 +38,39 @@ mod u32_math_tests {
     // Stamps the 22 `#[simplex::test]` entry points for u32. Logic lives in common::uint.
     uint_tests!(u32);
 }
+
+mod u32_math_tests_fuzz {
+    use super::*;
+
+    use common::uint_fuzz::TestUintFuzz;
+    use simplex::fuzz::FuzzEngineBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+
+    type U32MathFuzzEngineBuilder =
+        FuzzEngineBuilder<U32MathTestProgram, U32MathTestArguments, U32MathTestWitness>;
+
+    impl TestUintFuzz for u32 {
+        type Arguments = U32MathTestArguments;
+
+        fn arguments() -> Self::Arguments {
+            U32MathTestArguments {}
+        }
+
+        fn arb_any() -> BoxedStrategy<Self> {
+            any::<u32>().boxed()
+        }
+
+        fn arb_non_zero() -> BoxedStrategy<Self> {
+            any::<u32>()
+                .prop_filter("u32 should not be zero", |value| *value != 0)
+                .boxed()
+        }
+
+        fn arb_fitting(low: Self, high: Self) -> BoxedStrategy<Self> {
+            (low..=high).boxed()
+        }
+    }
+
+    uint_fuzz_tests!(u32, U32MathFuzzEngineBuilder);
+}
