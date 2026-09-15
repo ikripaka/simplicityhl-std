@@ -25,7 +25,7 @@ fn op(o: FunctionToTest) -> u8 {
 const DEFAULT_EXPECTED: [u8; 32] = [0; 32];
 
 fn program() -> U256TestDivProgram {
-    U256TestDivProgram::new(&U256TestDivArguments {})
+    U256TestDivProgram::new(U256TestDivArguments {})
 }
 
 fn build_witness(
@@ -395,6 +395,398 @@ mod u256_tests_arithmetic {
                 Some(DEFAULT_EXPECTED),
                 DEFAULT_EXPECTED,
             ),
+            Expect::AssertFailed,
+        )
+    }
+}
+
+mod u256_tests_arithmetic_fuzz {
+    use super::*;
+
+    use common::core::{Expect, FuzzExecutionCheck};
+    use simplex::fuzz;
+    use simplex::fuzz::builders::{FinalTransactionBuilder, ProgramTarget};
+    use simplex::fuzz::engine::FuzzStrategyBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+    use simplex::fuzz::{FuzzEngineBuilder, FuzzError};
+    use simplex::simplicityhl::{Arguments, WitnessValues};
+    use simplex::transaction::{FinalTransaction, PartialInput, RequiredSignature, UTXO};
+
+    const PROGRAM_TARGET: ProgramTarget = ProgramTarget::Input(0);
+
+    type U256DivFuzzEngineBuilder =
+        FuzzEngineBuilder<U256TestDivProgram, U256TestDivArguments, U256TestDivWitness>;
+
+    fn initial_transaction() -> FinalTransaction {
+        let mut tx = FinalTransaction::new();
+        tx.add_input(PartialInput::new(UTXO::default()), RequiredSignature::None);
+        tx
+    }
+
+    fn transaction_builder() -> Result<FinalTransactionBuilder, FuzzError> {
+        FinalTransactionBuilder::new(initial_transaction(), [PROGRAM_TARGET])
+    }
+
+    fn arb_u256_be() -> impl Strategy<Value = U256> {
+        any::<[u8; 32]>().prop_map(|bytes| U256::from_big_endian(&bytes))
+    }
+
+    fn arb_non_zero_u256_be() -> impl Strategy<Value = U256> {
+        arb_u256_be().prop_filter("u256 should not be zero", |value| !value.is_zero())
+    }
+
+    fn arb_u128() -> impl Strategy<Value = u128> {
+        any::<u128>()
+    }
+
+    fn arb_non_zero_u128() -> impl Strategy<Value = u128> {
+        arb_u128().prop_filter("u128 should not be zero", |value| *value != 0)
+    }
+
+    fn arb_128bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_u128().prop_map(U256::from)
+    }
+
+    fn arb_non_zero_128bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_non_zero_u128().prop_map(U256::from)
+    }
+
+    fn arb_127bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_u128().prop_map(|value| U256::from(value >> 1))
+    }
+
+    fn arb_non_zero_127bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_127bit_u256_be()
+            .prop_filter("127-bit u256 should not be zero", |value| !value.is_zero())
+    }
+
+    fn arb_255bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_u256_be().prop_map(|x| x >> 1)
+    }
+
+    fn arb_non_zero_u64() -> impl Strategy<Value = u64> {
+        any::<u64>().prop_filter("u64 should not be zero", |value| *value != 0)
+    }
+
+    fn arb_non_zero_64bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_non_zero_u64().prop_map(U256::from)
+    }
+
+    fn arb_128bit_u256_not_fitting_u64_be() -> impl Strategy<Value = U256> {
+        arb_u128().prop_map(|value| U256::from(value | (1_u128 << 64)))
+    }
+
+    fn successful_division_strategy(
+        function_index: u8,
+        inputs: BoxedStrategy<(U256, U256)>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U256TestDivArguments, U256TestDivWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(a, b)| {
+                let (quotient, remainder) = a.div_mod(b);
+                let arguments: Arguments = U256TestDivArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    function_index,
+                    a.to_big_endian(),
+                    b.to_big_endian(),
+                    Some(quotient.to_big_endian()),
+                    remainder.to_big_endian(),
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn zero_divisor_strategy(
+        function_index: u8,
+        inputs: BoxedStrategy<U256>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U256TestDivArguments, U256TestDivWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |a| {
+                let arguments: Arguments = U256TestDivArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    function_index,
+                    a.to_big_endian(),
+                    DEFAULT_EXPECTED,
+                    Some(DEFAULT_EXPECTED),
+                    DEFAULT_EXPECTED,
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn run_division_fuzz(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+        strategy: BoxedStrategy<(Arguments, WitnessValues)>,
+        expect: Expect,
+    ) -> anyhow::Result<()> {
+        let transaction_builder = transaction_builder()?;
+
+        fuzz_engine_builder
+            .build(strategy, transaction_builder)
+            .run_with_check(FuzzExecutionCheck::new("u256 division", expect));
+
+        Ok(())
+    }
+
+    #[simplex::fuzz]
+    fn test_div_mod_256_64(fuzz_engine_builder: U256DivFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256_64),
+                (arb_u256_be(), arb_non_zero_64bit_u256_be()).boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn test_div_mod_256_64_overflow(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            zero_divisor_strategy(op(FunctionToTest::DivMod256_64), arb_u256_be().boxed()),
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn test_div_mod_256_128(fuzz_engine_builder: U256DivFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256_128),
+                (arb_u256_be(), arb_128bit_u256_not_fitting_u64_be()).boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn test_div_mod_256_128_b_fits_into_u64(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256_128),
+                (arb_u256_be(), arb_non_zero_64bit_u256_be()).boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn test_div_mod_256_128_overflow(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            zero_divisor_strategy(op(FunctionToTest::DivMod256_128), arb_u256_be().boxed()),
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn test_div_mod_256_128_a_eq_b(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256_128),
+                arb_non_zero_128bit_u256_be()
+                    .prop_map(|value| (value, value))
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_a_less_than_b(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                arb_255bit_u256_be()
+                    .prop_map(|a| (a, a + U256::one()))
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_div_128(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                (arb_non_zero_127bit_u256_be(), arb_127bit_u256_be())
+                    .prop_map(|(b, offset)| (b + offset, b))
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_q_is_1(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                (
+                    arb_non_zero_128bit_u256_be(),
+                    arb_127bit_u256_be(),
+                    arb_127bit_u256_be(),
+                )
+                    .prop_map(|(high, b_low, delta)| {
+                        let high = high << 128;
+                        let b = high | b_low;
+                        let a = high | (b_low + delta);
+
+                        (a, b)
+                    })
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_b_fits_into_u128(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                (
+                    arb_non_zero_128bit_u256_be(),
+                    arb_128bit_u256_be(),
+                    arb_non_zero_128bit_u256_be(),
+                )
+                    .prop_map(|(high, low, b)| ((high << 128) | low, b))
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_b_is_u256(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                (
+                    arb_non_zero_127bit_u256_be(),
+                    arb_128bit_u256_be(),
+                    arb_non_zero_128bit_u256_be(),
+                )
+                    .prop_map(|(high, low, offset)| {
+                        let b = (high << 128) | low;
+
+                        (b + offset, b)
+                    })
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_a_equal_b(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                arb_non_zero_u256_be()
+                    .prop_map(|value| (value, value))
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_equal_high_words_max_low_diff(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                arb_non_zero_128bit_u256_be()
+                    .prop_map(|high| {
+                        let b = high << 128;
+
+                        (b | U256::from(u128::MAX), b)
+                    })
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_mod_256_eq_high_words_a_less_than_b(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::DivMod256),
+                arb_non_zero_128bit_u256_be()
+                    .prop_map(|high| {
+                        let a = high << 128;
+
+                        (a, a | U256::from(u128::MAX))
+                    })
+                    .boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_256(fuzz_engine_builder: U256DivFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            successful_division_strategy(
+                op(FunctionToTest::Div256),
+                (arb_u256_be(), arb_non_zero_u256_be()).boxed(),
+            ),
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_div_256_overflow(
+        fuzz_engine_builder: U256DivFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_division_fuzz(
+            fuzz_engine_builder,
+            zero_divisor_strategy(op(FunctionToTest::Div256), arb_u256_be().boxed()),
             Expect::AssertFailed,
         )
     }

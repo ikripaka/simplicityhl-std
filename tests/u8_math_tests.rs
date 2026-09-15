@@ -19,7 +19,7 @@ impl TestUint for u8 {
     const MUL_BOUND: u8 = 1 << 4; // 2^(8/2)
 
     fn program() -> U8MathTestProgram {
-        U8MathTestProgram::new(&U8MathTestArguments {})
+        U8MathTestProgram::new(U8MathTestArguments {})
     }
 
     fn witness(op: u8, a: u8, b: u8, expected: Option<u8>) -> U8MathTestWitness {
@@ -37,4 +37,40 @@ mod u8_math_tests {
 
     // Stamps the 22 `#[simplex::test]` entry points for u8. Logic lives in common::uint.
     uint_tests!(u8);
+}
+
+mod u8_math_tests_fuzz {
+    use super::*;
+
+    use common::uint_fuzz::TestUintFuzz;
+    use simplex::fuzz::FuzzEngineBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+
+    type U8MathFuzzEngineBuilder =
+        FuzzEngineBuilder<U8MathTestProgram, U8MathTestArguments, U8MathTestWitness>;
+
+    impl TestUintFuzz for u8 {
+        type Arguments = U8MathTestArguments;
+
+        fn arguments() -> Self::Arguments {
+            U8MathTestArguments {}
+        }
+
+        fn arb_any() -> BoxedStrategy<Self> {
+            any::<u8>().boxed()
+        }
+
+        fn arb_non_zero() -> BoxedStrategy<Self> {
+            any::<u8>()
+                .prop_filter("u8 should not be zero", |value| *value != 0)
+                .boxed()
+        }
+
+        fn arb_fitting(low: Self, high: Self) -> BoxedStrategy<Self> {
+            (low..=high).boxed()
+        }
+    }
+
+    uint_fuzz_tests!(u8, U8MathFuzzEngineBuilder);
 }

@@ -26,7 +26,7 @@ fn op(o: FunctionToTest) -> u8 {
 const DEFAULT_EXPECTED: [u8; 32] = [0; 32];
 
 fn program() -> U256TestSubMulProgram {
-    U256TestSubMulProgram::new(&U256TestSubMulArguments {})
+    U256TestSubMulProgram::new(U256TestSubMulArguments {})
 }
 
 fn build_witness(
@@ -256,6 +256,254 @@ mod u256_tests_arithmetic {
                 result_low,
             ),
             Expect::Ok,
+        )
+    }
+}
+
+mod u256_tests_arithmetic_fuzz {
+    use super::*;
+
+    use common::core::{Expect, FuzzExecutionCheck};
+    use simplex::fuzz;
+    use simplex::fuzz::builders::{FinalTransactionBuilder, ProgramTarget};
+    use simplex::fuzz::engine::FuzzStrategyBuilder;
+    use simplex::fuzz::proptest::prelude::{Just, any};
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+    use simplex::fuzz::{FuzzEngineBuilder, FuzzError};
+    use simplex::simplicityhl::{Arguments, WitnessValues};
+    use simplex::transaction::{FinalTransaction, PartialInput, RequiredSignature, UTXO};
+
+    const PROGRAM_TARGET: ProgramTarget = ProgramTarget::Input(0);
+    const EXPECTED_TRUE: bool = true;
+    const EXPECTED_FALSE: bool = false;
+
+    type U256SubMulFuzzEngineBuilder =
+        FuzzEngineBuilder<U256TestSubMulProgram, U256TestSubMulArguments, U256TestSubMulWitness>;
+
+    fn initial_transaction() -> FinalTransaction {
+        let mut tx = FinalTransaction::new();
+        tx.add_input(PartialInput::new(UTXO::default()), RequiredSignature::None);
+        tx
+    }
+
+    fn transaction_builder() -> Result<FinalTransactionBuilder, FuzzError> {
+        FinalTransactionBuilder::new(initial_transaction(), [PROGRAM_TARGET])
+    }
+
+    fn arb_u256_be() -> impl Strategy<Value = U256> {
+        any::<[u8; 32]>().prop_map(|bytes| U256::from_big_endian(&bytes))
+    }
+
+    fn arb_u128() -> impl Strategy<Value = u128> {
+        any::<u128>()
+    }
+
+    fn arb_128bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_u128().prop_map(U256::from)
+    }
+
+    fn arb_u64() -> impl Strategy<Value = u64> {
+        any::<u64>()
+    }
+
+    fn arb_64bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_u64().prop_map(U256::from)
+    }
+
+    fn arb_255bit_u256_be() -> impl Strategy<Value = U256> {
+        arb_u256_be().prop_map(|value| value >> 1)
+    }
+
+    fn subtraction_strategy(
+        expected_bool: bool,
+        inputs: BoxedStrategy<(U256, U256)>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U256TestSubMulArguments, U256TestSubMulWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(a, b)| {
+                let (expected, _) = a.overflowing_sub(b);
+                let arguments: Arguments = U256TestSubMulArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    op(FunctionToTest::Sub256),
+                    a.to_big_endian(),
+                    b.to_big_endian(),
+                    Some(expected.to_big_endian()),
+                    expected_bool,
+                    DEFAULT_EXPECTED,
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn multiplication_strategy(
+        function_index: u8,
+        expected_bool: bool,
+        inputs: BoxedStrategy<(U256, U256)>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U256TestSubMulArguments, U256TestSubMulWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(a, b)| {
+                let (high, low) = split_u512(a.full_mul(b).to_big_endian());
+                let arguments: Arguments = U256TestSubMulArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    function_index,
+                    a.to_big_endian(),
+                    b.to_big_endian(),
+                    Some(high),
+                    expected_bool,
+                    low,
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn run_successful_fuzz(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+        strategy: BoxedStrategy<(Arguments, WitnessValues)>,
+    ) -> anyhow::Result<()> {
+        let transaction_builder = transaction_builder()?;
+
+        fuzz_engine_builder
+            .build(strategy, transaction_builder)
+            .run_with_check(FuzzExecutionCheck::new(
+                "u256 subtraction or multiplication",
+                Expect::Ok,
+            ));
+
+        Ok(())
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_sub_256_not_overflow(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            subtraction_strategy(
+                EXPECTED_FALSE,
+                (arb_u256_be(), arb_u256_be())
+                    .prop_map(|(a, mask)| (a, a & mask))
+                    .boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_sub_256_a_eq_b(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            subtraction_strategy(
+                EXPECTED_FALSE,
+                arb_u256_be().prop_map(|value| (value, value)).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_sub_256_a_low_eq_b_low(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            subtraction_strategy(
+                EXPECTED_FALSE,
+                (arb_u256_be(), arb_128bit_u256_be())
+                    .prop_map(|(a, b_high)| {
+                        let b = ((a >> 128) & b_high) << 128 | U256::from(a.low_u128());
+
+                        (a, b)
+                    })
+                    .boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_sub_256_diff_is_u128_max(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            subtraction_strategy(
+                EXPECTED_FALSE,
+                arb_128bit_u256_be()
+                    .prop_map(|high| {
+                        let a = (high << 128) | U256::from(u128::MAX);
+                        let b = high << 128;
+
+                        (a, b)
+                    })
+                    .boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_sub_256_diff_is_u256_max(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            subtraction_strategy(EXPECTED_FALSE, Just((U256::MAX, U256::zero())).boxed()),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_sub_256_overflow(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            subtraction_strategy(
+                EXPECTED_TRUE,
+                arb_255bit_u256_be().prop_map(|a| (a, U256::MAX)).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_mul_256(fuzz_engine_builder: U256SubMulFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            multiplication_strategy(
+                op(FunctionToTest::Mul256),
+                EXPECTED_FALSE,
+                (arb_u256_be(), arb_u256_be()).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_mul_256_64(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            multiplication_strategy(
+                op(FunctionToTest::Mul256_64),
+                EXPECTED_FALSE,
+                (arb_u256_be(), arb_64bit_u256_be()).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u256_test_mul_256_128(
+        fuzz_engine_builder: U256SubMulFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            multiplication_strategy(
+                op(FunctionToTest::Mul256_128),
+                EXPECTED_FALSE,
+                (arb_u256_be(), arb_128bit_u256_be()).boxed(),
+            ),
         )
     }
 }

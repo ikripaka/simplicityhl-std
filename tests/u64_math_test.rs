@@ -19,7 +19,7 @@ impl TestUint for u64 {
     const MUL_BOUND: u64 = 1 << 32; // 2^(64/2)
 
     fn program() -> U64MathTestProgram {
-        U64MathTestProgram::new(&U64MathTestArguments {})
+        U64MathTestProgram::new(U64MathTestArguments {})
     }
 
     fn witness(op: u8, a: u64, b: u64, expected: Option<u64>) -> U64MathTestWitness {
@@ -37,4 +37,40 @@ mod u64_math_tests {
 
     // Stamps the 22 `#[simplex::test]` entry points for u64. Logic lives in common::uint.
     uint_tests!(u64);
+}
+
+mod u64_math_tests_fuzz {
+    use super::*;
+
+    use common::uint_fuzz::TestUintFuzz;
+    use simplex::fuzz::FuzzEngineBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+
+    type U64MathFuzzEngineBuilder =
+        FuzzEngineBuilder<U64MathTestProgram, U64MathTestArguments, U64MathTestWitness>;
+
+    impl TestUintFuzz for u64 {
+        type Arguments = U64MathTestArguments;
+
+        fn arguments() -> Self::Arguments {
+            U64MathTestArguments {}
+        }
+
+        fn arb_any() -> BoxedStrategy<Self> {
+            any::<u64>().boxed()
+        }
+
+        fn arb_non_zero() -> BoxedStrategy<Self> {
+            any::<u64>()
+                .prop_filter("u64 should not be zero", |value| *value != 0)
+                .boxed()
+        }
+
+        fn arb_fitting(low: Self, high: Self) -> BoxedStrategy<Self> {
+            (low..=high).boxed()
+        }
+    }
+
+    uint_fuzz_tests!(u64, U64MathFuzzEngineBuilder);
 }

@@ -34,7 +34,7 @@ fn op(o: FunctionToTest) -> u8 {
 const DEFAULT_EXPECTED: u128 = 0;
 
 fn program() -> U128BasicMathTestProgram {
-    U128BasicMathTestProgram::new(&U128BasicMathTestArguments {})
+    U128BasicMathTestProgram::new(U128BasicMathTestArguments {})
 }
 
 fn build_witness(
@@ -1000,6 +1000,628 @@ mod u128_tests_arithmetic {
                 DEFAULT_BOOL,
                 DEFAULT_EXPECTED,
             ),
+            Expect::AssertFailed,
+        )
+    }
+}
+
+mod u128_tests_arithmetic_fuzz {
+    use super::*;
+
+    use common::core::FuzzExecutionCheck;
+    use simplex::fuzz;
+    use simplex::fuzz::builders::{FinalTransactionBuilder, ProgramTarget};
+    use simplex::fuzz::engine::FuzzStrategyBuilder;
+    use simplex::fuzz::proptest::prelude::any;
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+    use simplex::fuzz::{FuzzEngineBuilder, FuzzError};
+    use simplex::simplicityhl::{Arguments, WitnessValues};
+    use simplex::transaction::{FinalTransaction, PartialInput, RequiredSignature, UTXO};
+
+    const PROGRAM_TARGET: ProgramTarget = ProgramTarget::Input(0);
+    const EXPECTED_FALSE: bool = false;
+    const EXPECTED_TRUE: bool = true;
+    const CARRY_OR_BORROW_LOW_FALSE: u128 = 0;
+    const CARRY_OR_BORROW_LOW_TRUE: u128 = 1;
+    const NORMALIZER_THRESHOLD: u128 = 1 << 63;
+
+    type U128BasicMathFuzzEngineBuilder = FuzzEngineBuilder<
+        U128BasicMathTestProgram,
+        U128BasicMathTestArguments,
+        U128BasicMathTestWitness,
+    >;
+    type U128BasicMathInputs = (u8, u128, u128, Option<u128>, bool, u128);
+
+    fn initial_transaction() -> FinalTransaction {
+        let mut tx = FinalTransaction::new();
+        tx.add_input(PartialInput::new(UTXO::default()), RequiredSignature::None);
+        tx
+    }
+
+    fn transaction_builder() -> Result<FinalTransactionBuilder, FuzzError> {
+        FinalTransactionBuilder::new(initial_transaction(), [PROGRAM_TARGET])
+    }
+
+    fn arb_non_zero_u64() -> impl Strategy<Value = u64> {
+        any::<u64>().prop_filter("u64 should not be zero", |value| *value != 0)
+    }
+
+    fn arb_non_zero_u128() -> impl Strategy<Value = u128> {
+        any::<u128>().prop_filter("u128 should not be zero", |value| *value != 0)
+    }
+
+    fn fuzz_strategy(
+        inputs: BoxedStrategy<U128BasicMathInputs>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U128BasicMathTestArguments, U128BasicMathTestWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(
+                |(function, a, b, expected, expected_bool, second_expected)| {
+                    let arguments: Arguments = U128BasicMathTestArguments {}.into();
+                    let witness: WitnessValues =
+                        build_witness(function, a, b, expected, expected_bool, second_expected)
+                            .into();
+
+                    (arguments, witness)
+                },
+            ))
+            .build()
+    }
+
+    fn run_u128_basic_math_fuzz(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+        strategy: BoxedStrategy<(Arguments, WitnessValues)>,
+        test_name: &'static str,
+        expect: Expect,
+    ) -> anyhow::Result<()> {
+        let transaction_builder = transaction_builder()?;
+
+        fuzz_engine_builder
+            .build(strategy, transaction_builder)
+            .run_with_check(FuzzExecutionCheck::new(test_name, expect));
+
+        Ok(())
+    }
+
+    fn full_add_reference(a: u128, b: u128, carry_low: bool) -> (u128, bool) {
+        let (sum, carry) = a.overflowing_add(b);
+
+        if carry_low {
+            let (sum, carry_from_low) = sum.overflowing_add(1);
+            (sum, carry || carry_from_low)
+        } else {
+            (sum, carry)
+        }
+    }
+
+    fn full_sub_reference(a: u128, b: u128, borrow_low: bool) -> (u128, bool) {
+        let (difference, borrow) = a.overflowing_sub(b);
+
+        if borrow_low {
+            let (difference, borrow_from_low) = difference.overflowing_sub(1);
+            (difference, borrow || borrow_from_low)
+        } else {
+            (difference, borrow)
+        }
+    }
+
+    #[simplex::fuzz]
+    fn add_128(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (result, carry) = a.overflowing_add(b);
+                        (
+                            op(FunctionToTest::Add128),
+                            a,
+                            b,
+                            Some(result),
+                            carry,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "add_128",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn add_128_64(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u64>())
+                    .prop_map(|(a, b)| {
+                        let b = u128::from(b);
+                        let (result, carry) = a.overflowing_add(b);
+                        (
+                            op(FunctionToTest::Add128_64),
+                            a,
+                            b,
+                            Some(result),
+                            carry,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "add_128_64",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn full_add_128_without_carry_low(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (result, carry) = full_add_reference(a, b, EXPECTED_FALSE);
+                        (
+                            op(FunctionToTest::FullAdd128),
+                            a,
+                            b,
+                            Some(result),
+                            carry,
+                            CARRY_OR_BORROW_LOW_FALSE,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "full_add_128 without carry low",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn full_add_128_with_carry_low(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (result, carry) = full_add_reference(a, b, EXPECTED_TRUE);
+                        (
+                            op(FunctionToTest::FullAdd128),
+                            a,
+                            b,
+                            Some(result),
+                            carry,
+                            CARRY_OR_BORROW_LOW_TRUE,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "full_add_128 with carry low",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn sub_128(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (result, borrow) = a.overflowing_sub(b);
+                        (
+                            op(FunctionToTest::Sub128),
+                            a,
+                            b,
+                            Some(result),
+                            borrow,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "sub_128",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn full_sub_128_without_borrow_low(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (result, borrow) = full_sub_reference(a, b, EXPECTED_FALSE);
+                        (
+                            op(FunctionToTest::FullSub128),
+                            a,
+                            b,
+                            Some(result),
+                            borrow,
+                            CARRY_OR_BORROW_LOW_FALSE,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "full_sub_128 without borrow low",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn full_sub_128_with_borrow_low(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (result, borrow) = full_sub_reference(a, b, EXPECTED_TRUE);
+                        (
+                            op(FunctionToTest::FullSub128),
+                            a,
+                            b,
+                            Some(result),
+                            borrow,
+                            CARRY_OR_BORROW_LOW_TRUE,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "full_sub_128 with borrow low",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn mul_128(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u128>())
+                    .prop_map(|(a, b)| {
+                        let (high, low) = split_helper(U256::from(a) * U256::from(b));
+                        (
+                            op(FunctionToTest::Mul128),
+                            a,
+                            b,
+                            Some(high),
+                            EXPECTED_FALSE,
+                            low,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "mul_128",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn mul_128_64(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), any::<u64>())
+                    .prop_map(|(a, b)| {
+                        let b = u128::from(b);
+                        let (high, low) = split_helper(U256::from(a) * U256::from(b));
+                        (
+                            op(FunctionToTest::Mul128_64),
+                            a,
+                            b,
+                            Some(high),
+                            EXPECTED_FALSE,
+                            low,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "mul_128_64",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn calculate_normalizer_base_64_for_u64(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_non_zero_u64()
+                    .prop_map(|b| {
+                        let b = u128::from(b);
+                        (
+                            op(FunctionToTest::CalculateNormalizerBase64),
+                            DEFAULT_EXPECTED,
+                            b,
+                            Some(NORMALIZER_THRESHOLD.div_ceil(b)),
+                            EXPECTED_FALSE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "calculate_normalizer_base_64 for u64",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn calculate_normalizer_base_64_for_u128(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_non_zero_u64(), any::<u64>())
+                    .prop_map(|(high, low)| {
+                        let b = (u128::from(high) << 64) | u128::from(low);
+                        (
+                            op(FunctionToTest::CalculateNormalizerBase64),
+                            DEFAULT_EXPECTED,
+                            b,
+                            Some(NORMALIZER_THRESHOLD.div_ceil(u128::from(high))),
+                            EXPECTED_TRUE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "calculate_normalizer_base_64 for u128",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn calculate_normalizer_base_64_rejects_wrong_u64_flag(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (arb_non_zero_u64(), any::<u64>())
+                    .prop_map(|(high, low)| {
+                        let b = (u128::from(high) << 64) | u128::from(low);
+                        (
+                            op(FunctionToTest::CalculateNormalizerBase64),
+                            DEFAULT_EXPECTED,
+                            b,
+                            Some(DEFAULT_EXPECTED),
+                            EXPECTED_FALSE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "calculate_normalizer_base_64 wrong u64 flag",
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn calculate_normalizer_base_64_rejects_wrong_u128_flag(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                arb_non_zero_u64()
+                    .prop_map(|b| {
+                        (
+                            op(FunctionToTest::CalculateNormalizerBase64),
+                            DEFAULT_EXPECTED,
+                            u128::from(b),
+                            Some(DEFAULT_EXPECTED),
+                            EXPECTED_TRUE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "calculate_normalizer_base_64 wrong u128 flag",
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn estimate_quotient_digit_base_64(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (
+                    any::<u64>()
+                        .prop_filter("normalized divisor high word", |value| *value >= (1 << 63)),
+                    any::<u64>(),
+                    any::<u128>(),
+                )
+                    .prop_flat_map(|(b_high, b_low, a_low)| {
+                        (0..b_high).prop_map(move |a_high| {
+                            let a = (U256::from(a_high) << 128) | U256::from(a_low);
+                            let b = (u128::from(b_high) << 64) | u128::from(b_low);
+                            let quotient = (a / U256::from(b)).as_u128();
+
+                            (
+                                op(FunctionToTest::EstimateQuotientDigitBase64),
+                                u128::from(a_high),
+                                a_low,
+                                Some(quotient),
+                                EXPECTED_FALSE,
+                                b,
+                            )
+                        })
+                    })
+                    .boxed(),
+            ),
+            "estimate_quotient_digit_base_64",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn estimate_quotient_digit_base_64_rejects_overflow(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (
+                    any::<u64>().prop_filter("non-max normalized divisor high word", |value| {
+                        *value >= (1 << 63) && *value < u64::MAX
+                    }),
+                    any::<u64>(),
+                    any::<u128>(),
+                )
+                    .prop_flat_map(|(b_high, b_low, a_low)| {
+                        ((b_high + 1)..=u64::MAX).prop_map(move |a_high| {
+                            let a = (U256::from(a_high) << 128) | U256::from(a_low);
+                            let b = (u128::from(b_high) << 64) | u128::from(b_low);
+                            let quotient = (a / U256::from(b)).as_u128();
+
+                            (
+                                op(FunctionToTest::EstimateQuotientDigitBase64),
+                                u128::from(a_high),
+                                a_low,
+                                Some(quotient),
+                                EXPECTED_FALSE,
+                                b,
+                            )
+                        })
+                    })
+                    .boxed(),
+            ),
+            "estimate_quotient_digit_base_64 overflow",
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn div_mod_128_64(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), arb_non_zero_u64())
+                    .prop_map(|(a, b)| {
+                        let b = u128::from(b);
+                        (
+                            op(FunctionToTest::DivMod128_64),
+                            a,
+                            b,
+                            Some(a / b),
+                            EXPECTED_FALSE,
+                            a % b,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "div_mod_128_64",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn div_mod_128_64_rejects_zero_divisor(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                any::<u128>()
+                    .prop_map(|a| {
+                        (
+                            op(FunctionToTest::DivMod128_64),
+                            a,
+                            DEFAULT_EXPECTED,
+                            Some(DEFAULT_EXPECTED),
+                            EXPECTED_FALSE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "div_mod_128_64 zero divisor",
+            Expect::AssertFailed,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn div_mod_128(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), arb_non_zero_u128())
+                    .prop_map(|(a, b)| {
+                        (
+                            op(FunctionToTest::DivMod128),
+                            a,
+                            b,
+                            Some(a / b),
+                            EXPECTED_FALSE,
+                            a % b,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "div_mod_128",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn div_128(fuzz_engine_builder: U128BasicMathFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                (any::<u128>(), arb_non_zero_u128())
+                    .prop_map(|(a, b)| {
+                        (
+                            op(FunctionToTest::Div128),
+                            a,
+                            b,
+                            Some(a / b),
+                            EXPECTED_FALSE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "div_128",
+            Expect::Ok,
+        )
+    }
+
+    #[simplex::fuzz]
+    fn div_128_rejects_zero_divisor(
+        fuzz_engine_builder: U128BasicMathFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_u128_basic_math_fuzz(
+            fuzz_engine_builder,
+            fuzz_strategy(
+                any::<u128>()
+                    .prop_map(|a| {
+                        (
+                            op(FunctionToTest::Div128),
+                            a,
+                            DEFAULT_EXPECTED,
+                            Some(DEFAULT_EXPECTED),
+                            EXPECTED_FALSE,
+                            DEFAULT_EXPECTED,
+                        )
+                    })
+                    .boxed(),
+            ),
+            "div_128 zero divisor",
             Expect::AssertFailed,
         )
     }

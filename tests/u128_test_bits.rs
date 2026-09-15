@@ -26,7 +26,7 @@ fn op(o: FunctionToTest) -> u8 {
 const DEFAULT_EXPECTED: u128 = 0;
 
 fn program() -> U128TestBitsProgram {
-    U128TestBitsProgram::new(&U128TestBitsArguments {})
+    U128TestBitsProgram::new(U128TestBitsArguments {})
 }
 
 fn build_witness(
@@ -228,6 +228,292 @@ mod u128_tests_bits {
                 DEFAULT_BOOL,
             ),
             Expect::Ok,
+        )
+    }
+}
+
+mod u128_tests_bits_fuzz {
+    use super::*;
+
+    use common::core::FuzzExecutionCheck;
+    use simplex::fuzz;
+    use simplex::fuzz::builders::{FinalTransactionBuilder, ProgramTarget};
+    use simplex::fuzz::engine::FuzzStrategyBuilder;
+    use simplex::fuzz::proptest::prelude::{Just, any};
+    use simplex::fuzz::proptest::strategy::{BoxedStrategy, Strategy};
+    use simplex::fuzz::{FuzzEngineBuilder, FuzzError};
+    use simplex::simplicityhl::{Arguments, WitnessValues};
+    use simplex::transaction::{FinalTransaction, PartialInput, RequiredSignature, UTXO};
+
+    const PROGRAM_TARGET: ProgramTarget = ProgramTarget::Input(0);
+    const EXPECTED_TRUE: bool = true;
+    const EXPECTED_FALSE: bool = false;
+
+    type U128BitFuzzEngineBuilder =
+        FuzzEngineBuilder<U128TestBitsProgram, U128TestBitsArguments, U128TestBitsWitness>;
+
+    fn initial_transaction() -> FinalTransaction {
+        let mut tx = FinalTransaction::new();
+        tx.add_input(PartialInput::new(UTXO::default()), RequiredSignature::None);
+        tx
+    }
+
+    fn transaction_builder() -> Result<FinalTransactionBuilder, FuzzError> {
+        FinalTransactionBuilder::new(initial_transaction(), [PROGRAM_TARGET])
+    }
+
+    fn arb_u128() -> impl Strategy<Value = u128> {
+        any::<u128>()
+    }
+
+    fn arb_non_zero_u128() -> impl Strategy<Value = u128> {
+        arb_u128().prop_filter("u128 should not be zero", |value| *value != 0)
+    }
+
+    fn arb_non_zero_in_range_shift_u8() -> impl Strategy<Value = u8> {
+        any::<u8>().prop_filter("shift should be in 1..128", |shift| {
+            *shift > 0 && *shift < 128
+        })
+    }
+
+    fn arb_out_of_range_shift_u8() -> impl Strategy<Value = u8> {
+        any::<u8>().prop_filter("shift should be in 128..=255", |shift| *shift >= 128)
+    }
+
+    fn bitwise_strategy(
+        function_index: u8,
+        expected_bool: bool,
+        inputs: BoxedStrategy<(u128, u128)>,
+        operation: fn(u128, u128) -> u128,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U128TestBitsArguments, U128TestBitsWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(a, b)| {
+                let arguments: Arguments = U128TestBitsArguments {}.into();
+                let witness: WitnessValues =
+                    build_witness(function_index, a, b, Some(operation(a, b)), expected_bool)
+                        .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn equality_strategy(
+        expected_bool: bool,
+        inputs: BoxedStrategy<(u128, u128)>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U128TestBitsArguments, U128TestBitsWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(a, b)| {
+                let arguments: Arguments = U128TestBitsArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    op(FunctionToTest::Eq128),
+                    a,
+                    b,
+                    Some(DEFAULT_EXPECTED),
+                    expected_bool,
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn shift_strategy(
+        function_index: u8,
+        expected_bool: bool,
+        inputs: BoxedStrategy<(u128, u8)>,
+        operation: fn(u128, u8) -> u128,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U128TestBitsArguments, U128TestBitsWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(value, shift)| {
+                let arguments: Arguments = U128TestBitsArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    function_index,
+                    u128::from(shift),
+                    value,
+                    Some(operation(value, shift)),
+                    expected_bool,
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn out_of_range_shift_strategy(
+        function_index: u8,
+        expected_bool: bool,
+        inputs: BoxedStrategy<(u128, u8)>,
+    ) -> BoxedStrategy<(Arguments, WitnessValues)> {
+        FuzzStrategyBuilder::<U128TestBitsArguments, U128TestBitsWitness, _>::new()
+            .with_custom_strategy(inputs.prop_map(move |(value, shift)| {
+                let arguments: Arguments = U128TestBitsArguments {}.into();
+                let witness: WitnessValues = build_witness(
+                    function_index,
+                    u128::from(shift),
+                    value,
+                    Some(DEFAULT_EXPECTED),
+                    expected_bool,
+                )
+                .into();
+
+                (arguments, witness)
+            }))
+            .build()
+    }
+
+    fn run_successful_fuzz(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+        strategy: BoxedStrategy<(Arguments, WitnessValues)>,
+    ) -> anyhow::Result<()> {
+        let transaction_builder = transaction_builder()?;
+
+        fuzz_engine_builder
+            .build(strategy, transaction_builder)
+            .run_with_check(FuzzExecutionCheck::new("u128 bit operation", Expect::Ok));
+
+        Ok(())
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_and_128(fuzz_engine_builder: U128BitFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            bitwise_strategy(
+                op(FunctionToTest::And128),
+                EXPECTED_FALSE,
+                (arb_u128(), arb_u128()).boxed(),
+                |a, b| a & b,
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_or_128(fuzz_engine_builder: U128BitFuzzEngineBuilder) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            bitwise_strategy(
+                op(FunctionToTest::Or128),
+                EXPECTED_FALSE,
+                (arb_u128(), arb_u128()).boxed(),
+                |a, b| a | b,
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_eq_128_true(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            equality_strategy(
+                EXPECTED_TRUE,
+                arb_u128().prop_map(|value| (value, value)).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_eq_128_false(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            equality_strategy(
+                EXPECTED_FALSE,
+                arb_non_zero_u128().prop_map(|a| (a, a - 1)).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_left_shift_128(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            shift_strategy(
+                op(FunctionToTest::LeftShift128),
+                EXPECTED_FALSE,
+                (arb_u128(), arb_non_zero_in_range_shift_u8()).boxed(),
+                |value, shift| value << shift,
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_left_shift_128_by_zero(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            shift_strategy(
+                op(FunctionToTest::LeftShift128),
+                EXPECTED_FALSE,
+                (arb_u128(), Just(0_u8)).boxed(),
+                |value, shift| value << shift,
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_left_shift_128_out_of_range(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            out_of_range_shift_strategy(
+                op(FunctionToTest::LeftShift128),
+                EXPECTED_FALSE,
+                (arb_u128(), arb_out_of_range_shift_u8()).boxed(),
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_right_shift_128(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            shift_strategy(
+                op(FunctionToTest::RightShift128),
+                EXPECTED_FALSE,
+                (arb_u128(), arb_non_zero_in_range_shift_u8()).boxed(),
+                |value, shift| value >> shift,
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_right_shift_128_by_zero(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            shift_strategy(
+                op(FunctionToTest::RightShift128),
+                EXPECTED_FALSE,
+                (arb_u128(), Just(0_u8)).boxed(),
+                |value, shift| value >> shift,
+            ),
+        )
+    }
+
+    #[simplex::fuzz]
+    fn u128_test_bits_right_shift_128_out_of_range(
+        fuzz_engine_builder: U128BitFuzzEngineBuilder,
+    ) -> anyhow::Result<()> {
+        run_successful_fuzz(
+            fuzz_engine_builder,
+            out_of_range_shift_strategy(
+                op(FunctionToTest::RightShift128),
+                EXPECTED_FALSE,
+                (arb_u128(), arb_out_of_range_shift_u8()).boxed(),
+            ),
         )
     }
 }
